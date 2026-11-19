@@ -43,6 +43,7 @@ by hand wins: this only ever ADDS, so an explicit choice is never overridden.
 """
 import json
 import os
+import time
 
 # AUTO_LAYOUT=1 decides and applies. AUTO_LAYOUT=shadow decides, logs, and
 # applies NOTHING: the render is byte-for-byte what it would have been.
@@ -220,15 +221,31 @@ def pick(video_path, video_duration):
         client = genai.Client(api_key=api_key)
         parts = [genai_types.Part.from_bytes(data=b, mime_type="image/jpeg")
                  for b in frames]
-        response = client.models.generate_content(
-            model=model_name,
-            contents=parts + [gemini_worker.LAYOUT_CHOICE_PROMPT],
-            config=genai_types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=gemini_worker.LayoutChoice,
-            ))
-        gemini_worker.raise_if_blocked(response)
-        answer = json.loads(response.text) or {}
+        # One busy answer (503) or a per-minute limit (429) used to drop the
+        # layout for the whole job; a few tries cost seconds, not a framing.
+        for attempt in range(4):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=parts + [gemini_worker.LAYOUT_CHOICE_PROMPT],
+                    config=genai_types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=gemini_worker.LayoutChoice,
+                    ))
+                gemini_worker.raise_if_blocked(response)
+                answer = json.loads(response.text) or {}
+                break
+            except gemini_worker.GeminiBlockedError:
+                raise
+            except Exception as e:
+                transient = any(t in str(e) for t in (
+                    "503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL",
+                    "overloaded", "Deadline")) or isinstance(e, (ValueError, TypeError))
+                if attempt == 3 or not transient:
+                    raise
+                wait = gemini_worker.retry_wait(e, attempt)
+                print(f"   ⏳ Layout choice: busy model, retrying in {wait:.0f}s")
+                time.sleep(wait)
     except Exception as e:
         print(f"   ⚠️ Layout choice failed ({e}) — keeping the default layout.")
         return "none"

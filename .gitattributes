@@ -1,0 +1,5 @@
+# Shell scripts run inside the Linux image (bin/ffmpeg is first on its PATH).
+# A Windows checkout with core.autocrlf=true wrote them with CRLF, and the
+# wrapper then failed on some arguments inside the container.
+bin/* text eol=lf
+*.sh text eol=lf

@@ -534,8 +534,15 @@ def clean_metadata(path):
                     clip[key] = value[:MAX_TEXT]
                 elif key in ("title", "video_title_for_youtube_short", "description",
                              "video_description_for_tiktok", "video_description_for_instagram",
+                             "video_description_for_youtube_short",
                              "hook", "why") and value is not None and not isinstance(value, str):
                     clip[key] = str(value)[:MAX_TEXT]
+            tags = clip.get("youtube_hashtags")
+            if tags is not None:
+                # A list of short strings, or nothing: never a structure.
+                clip["youtube_hashtags"] = ([str(t)[:64] for t in tags[:8]
+                                             if isinstance(t, (str, int, float))]
+                                            if isinstance(tags, list) else [])
             recipe = clip.get("recipe")
             if isinstance(recipe, dict):
                 segments = recipe.get("segments")
@@ -546,6 +553,9 @@ def clean_metadata(path):
                 clip.pop("recipe", None)
             clean.append(clip)
         data["shorts"] = clean
+    # The rated candidate list (RATE_CLIPS) is display data a worker never
+    # needs to send (RATE_CLIPS is not a job option it receives): dropped.
+    data.pop("candidates", None)
     source = data.get("source_video")
     if source is not None:
         base = os.path.basename(str(source))

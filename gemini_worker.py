@@ -2,6 +2,7 @@ import argparse
 import json
 import mimetypes
 import os
+import re
 import sys
 from typing import List, Optional
 
@@ -44,6 +45,10 @@ class DetailClipModel(BaseModel):
     # the dashboard. Defaulted so a small local model that skips it does not
     # fail schema validation and lose the clip.
     why: str = ""
+    # Publish-ready YouTube Shorts copy. Defaulted for the same reason as
+    # `why`; normalize_youtube_copy() fills and repairs both in code.
+    video_description_for_youtube_short: str = ""
+    youtube_hashtags: List[str] = []
 
 
 class DetailResponse(BaseModel):
@@ -61,10 +66,133 @@ class VisualClipModel(BaseModel):
     video_description_for_instagram: str
     video_title_for_youtube_short: str
     viral_hook_text: str
+    video_description_for_youtube_short: str = ""
+    youtube_hashtags: List[str] = []
 
 
 class VisualResponse(BaseModel):
     shorts: List[VisualClipModel]
+
+
+# --- YouTube Shorts copy: the model's output is not trusted, so the title,
+# --- description and hashtags are made safe and consistent in code. ---
+
+YT_TITLE_MAX_CHARS = 100          # YouTube's hard limit on titles
+YT_DESCRIPTION_MAX_BYTES = 5000   # YouTube's hard limit (UTF-8 bytes)
+YT_TOPICAL_TAGS_MAX = 5           # plus "#Shorts" = 6 tags at most
+YT_SHORTS_TAG = "#Shorts"
+_YT_TAG_MAX_CHARS = 50
+_YT_TAG_RE = re.compile(r"#\w+")
+_YT_TAG_FULL_RE = re.compile(r"#\w{1,%d}" % _YT_TAG_MAX_CHARS)
+# YouTube's API rejects titles/descriptions containing angle brackets.
+_YT_FORBIDDEN = str.maketrans("", "", "<>")
+
+
+def _yt_text(value) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        value = str(value)
+    return value.translate(_YT_FORBIDDEN).strip()
+
+
+def _yt_clean_tag(raw) -> Optional[str]:
+    """One hashtag in canonical form, or None when it cannot be one."""
+    tag = _yt_text(raw)
+    if not tag:
+        return None
+    if not tag.startswith("#"):
+        tag = "#" + tag
+    if not _YT_TAG_FULL_RE.fullmatch(tag):
+        return None  # spaces, punctuation, a bare "#", or too long
+    body = tag[1:]
+    if not re.search(r"[^\W\d_]", body):
+        return None  # digits/underscores only: not a topic
+    if body.lower() == "shorts":
+        return YT_SHORTS_TAG
+    return tag
+
+
+def _yt_tag_list(value) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        # A model that returns "#a #b, #c" instead of a list.
+        return [p for p in re.split(r"[\s,]+", value) if p]
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
+
+def _yt_trim_bytes(text: str, max_bytes: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max(max_bytes, 0)].decode("utf-8", "ignore").rstrip()
+
+
+def normalize_youtube_copy(clip: dict) -> dict:
+    """Make a clip's YouTube Shorts copy publish-safe. Mutates and returns ``clip``.
+
+    - ``video_title_for_youtube_short``: string, no ``<``/``>``, whitespace
+      collapsed, at most 100 chars; falls back to ``viral_hook_text`` if empty.
+    - ``youtube_hashtags``: taken from the list (or derived from the
+      description when the list is empty), each a single ``#word`` token,
+      deduped case-insensitively, at most 5 topical tags, always ending with
+      ``#Shorts``.
+    - ``video_description_for_youtube_short``: falls back to the title when
+      empty, gets any tag from the list it does not already contain appended
+      (so it always carries ``#Shorts``), and fits YouTube's 5000-byte limit.
+
+    Idempotent: running it on its own output changes nothing. A non-dict is
+    returned untouched.
+    """
+    if not isinstance(clip, dict):
+        return clip
+
+    title = " ".join(_yt_text(clip.get("video_title_for_youtube_short")).split())
+    if not title:
+        title = " ".join(_yt_text(clip.get("viral_hook_text")).split())
+    title = title[:YT_TITLE_MAX_CHARS].rstrip()
+
+    description = _yt_text(clip.get("video_description_for_youtube_short"))
+    if not description:
+        description = title
+
+    raw_tags = _yt_tag_list(clip.get("youtube_hashtags"))
+    if not any(_yt_clean_tag(t) for t in raw_tags):
+        raw_tags = _YT_TAG_RE.findall(description)
+
+    topical: List[str] = []
+    seen = {YT_SHORTS_TAG.lower()}
+    for raw in raw_tags:
+        tag = _yt_clean_tag(raw)
+        if tag is None or tag.lower() in seen:
+            continue
+        seen.add(tag.lower())
+        topical.append(tag)
+        if len(topical) >= YT_TOPICAL_TAGS_MAX:
+            break
+    tags = topical + [YT_SHORTS_TAG]
+
+    def _with_missing_tags(text: str) -> str:
+        present = {t.lower() for t in _YT_TAG_RE.findall(text)}
+        missing = [t for t in tags if t.lower() not in present]
+        return (text.rstrip() + " " + " ".join(missing)).strip() if missing else text
+
+    out = _with_missing_tags(description)
+    if len(out.encode("utf-8")) > YT_DESCRIPTION_MAX_BYTES:
+        # Trim the text with room for every tag, so the limit can never cost
+        # #Shorts and a second pass finds nothing to append or trim.
+        reserve = len((" " + " ".join(tags)).encode("utf-8"))
+        out = _with_missing_tags(
+            _yt_trim_bytes(description, YT_DESCRIPTION_MAX_BYTES - reserve))
+    description = out
+
+    clip["video_title_for_youtube_short"] = title
+    clip["video_description_for_youtube_short"] = description
+    clip["youtube_hashtags"] = tags
+    return clip
 
 
 VISUAL_PROMPT_TEMPLATE = """
@@ -84,6 +212,13 @@ TIME CONTRACT — STRICT:
 For each clip write catchy copy in {language} (a scroll-stopping hook, a TikTok
 and an Instagram description, and a YouTube title ≤100 chars). Order clips best
 to worst by how likely they are to stop a viewer scrolling.
+
+YouTube Shorts copy, also in {language}:
+- `video_description_for_youtube_short`: 1-2 sentences that tease the payoff
+  without spoiling it, then 3-5 topical hashtags, always ending with #Shorts.
+  Max ~300 characters.
+- `youtube_hashtags`: the same 3-5 topical hashtags plus "#Shorts", each
+  starting with "#" and with no spaces inside a tag.
 """
 
 
@@ -344,6 +479,11 @@ COPY RULES — ALL text fields (descriptions, title, hook) MUST be written in TR
 - Descriptions (TikTok + Instagram): 1-2 punchy sentences that tease the payoff
   without spoiling it, then 3-5 topically relevant hashtags. No generic hashtag spam.
 - `video_title_for_youtube_short`: max 100 chars, curiosity-driven, no fake claims.
+- `video_description_for_youtube_short`: 1-2 sentences that tease the payoff
+  without spoiling it, then 3-5 topical hashtags, always ending with #Shorts.
+  Max ~300 characters.
+- `youtube_hashtags`: the same 3-5 topical hashtags plus "#Shorts", each
+  starting with "#" and with no spaces inside a tag.
 - `predicted_score`: honest 0-100 estimate of viral potential.
 - `why`: one sentence, max 20 words, naming what makes THIS moment worth a
   clip — the specific hook, claim, number or payoff, not the topic.
@@ -364,6 +504,8 @@ Return only:
       "video_description_for_tiktok": "<description + hashtags>",
       "video_description_for_instagram": "<description + hashtags>",
       "video_title_for_youtube_short": "<title max 100 chars>",
+      "video_description_for_youtube_short": "<1-2 sentences + 3-5 hashtags, ending with #Shorts>",
+      "youtube_hashtags": ["#topic", "#topic", "#topic", "#Shorts"],
       "viral_hook_text": "<short overlay max 10 words>",
       "why": "<one sentence, max 20 words>"
     }}
@@ -467,6 +609,31 @@ class GeminiBlockedError(ValueError):
 
 _BLOCKED_FINISH_REASONS = {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST",
                            "SPII", "IMAGE_SAFETY", "RECITATION"}
+
+
+# A per-minute quota (429 RESOURCE_EXHAUSTED) does not clear in 5-10 s: the
+# window is a minute. Several jobs calling at once hit it (19-nov-2026: five
+# 90-min chunks in parallel lost two runs to it after their transcription).
+RATE_LIMIT_MARKERS = ("429", "RESOURCE_EXHAUSTED")
+_RETRY_DELAY = re.compile(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s")
+
+
+def is_rate_limited(message) -> bool:
+    return any(m in str(message) for m in RATE_LIMIT_MARKERS)
+
+
+def retry_wait(message, attempt) -> float:
+    """Seconds to wait before retry number ``attempt`` (0-based) of a model
+    call that failed with ``message``: Google's own ``retryDelay`` when it
+    names one, else 20/40/60 s for a rate limit and 5/10/20/40 s for anything
+    else transient (overload, empty body)."""
+    text = str(message)
+    if is_rate_limited(text):
+        m = _RETRY_DELAY.search(text)
+        if m:
+            return min(90.0, float(m.group(1)) + 2.0)
+        return min(60.0, 20.0 * (attempt + 1))
+    return min(40.0, 5.0 * (2 ** attempt))
 
 
 def raise_if_blocked(response):

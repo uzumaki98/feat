@@ -48,6 +48,7 @@ Ingest (yt-dlp or upload) → transcription (word timestamps) → scene detectio
 - Concurrency/VRAM, auto-retry, deploy handover and drain → `docs/architecture/jobs-and-deploys.md`
 - Download routing, yt-dlp clients, paid proxy ledger → `docs/architecture/proxy-routing.md`
 - Remote CPU worker (second host renders free jobs) → `docs/architecture/remote-worker.md`
+- Headless runner, clip rating, top-N render, house edit (trim, cold open, punch-ins, SFX), Shorts checks, approval package and credited posting → `docs/architecture/shorts-automation.md`
 
 ## Hard rules
 

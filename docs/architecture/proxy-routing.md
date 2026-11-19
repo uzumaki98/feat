@@ -18,6 +18,25 @@ SABR-only, which yt-dlp reports as "Video unavailable" and looks like an IP ban.
 `player_skip: webpage` back.** Every attempt asks for the 1080p format spec (the
 old `best[ext=mp4]` spec was itself the 360p progressive file).
 
+**Last attempt: the embedded player's client** (`yt_clients.EMBEDDED_CLIENTS`,
+label `embedded`), anonymous and on free bytes only (own IP or a static, never
+the per-GB proxy). On an address YouTube is throttling (429 on the watch page)
+the list above extracts 1080p but its media URL answers 403 some 20 MB in, on
+every retry, while this client downloads the same file whole. It is a list of
+its own, not one more entry in the list above: yt-dlp keeps the first client's
+URL for a format, and a video that cannot be embedded has no formats here.
+
+**A stream that is still live** (`main._live_head`), with a cap on the
+minutes (`MAX_SOURCE_MINUTES` / `SOURCE_CAP_MINUTES`): its first N minutes are
+fetched from the start of the broadcast with yt-dlp `live_from_start`, as fast
+as the CDN serves them, instead of recording the live edge in real time. yt-dlp
+refuses a time range there, so each stream is stopped by fragment index x the
+format's `target_duration`, and the two partial files are merged with
+`ffmpeg -c copy`. Only when every chosen format is a from-start DASH fragment
+stream; anything else takes the ordinary path. One fragment at a time: with
+concurrent fragments the stop raised in a worker thread was swallowed. A time
+backstop (1.2x the cap) stops it should it ever be following the live edge.
+
 ## Cookies: first attempt with, second without
 
 The probe carries `YOUTUBE_COOKIES`, like the download does: an anonymous probe

@@ -67,3 +67,13 @@ def test_probe_uses_the_same_lists(monkeypatch):
         (yt_clients.hd_extractor_args("", "/opt/gen.js"), True),
         (yt_clients.fallback_extractor_args("", "/opt/gen.js"), False),
     ]
+
+
+def test_embedded_is_its_own_list():
+    # Not appended to the HD list: yt-dlp keeps the first client's URL per
+    # format, and the point of this attempt is a different client's URL.
+    args = yt_clients.embedded_extractor_args("", "/x.js")
+    assert args["youtube"]["player_client"] == ["web_embedded"]
+    assert "player_skip" not in args["youtube"]
+    assert "youtubepot-bgutilscript" in args
+    assert yt_clients.HD_CLIENTS == ["default", "mweb"]

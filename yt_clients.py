@@ -23,6 +23,15 @@ first is "unsupported", the second is skipped whenever cookies are present.
 
 HD_CLIENTS = ["default", "mweb"]
 
+# The download's last attempt (``main.plan_download_attempts``, 'embedded'):
+# the embedded player's client alone, anonymous. Measured on 16-nov-2026 from
+# a throttled home address (429 on the watch page, no cookies): the list
+# above extracted 1080p but its media URL answered 403 after ~20 MB on every
+# retry, and this client downloaded the same file whole. Kept apart from the
+# list above, not appended to it: yt-dlp keeps the first client's URL for a
+# format, and a video that cannot be embedded has no formats here at all.
+EMBEDDED_CLIENTS = ["web_embedded"]
+
 
 class NotASingleVideo(ValueError):
     """The URL is a YouTube page that is not one video (search, playlist,
@@ -121,3 +130,9 @@ def fallback_extractor_args(bgutil_http, bgutil_script):
     format, which is enough for a probe and better than no download."""
     return {**pot_provider_args(bgutil_http, bgutil_script),
             "youtube": {"player_client": list(HD_CLIENTS)}}
+
+
+def embedded_extractor_args(bgutil_http, bgutil_script):
+    """Extractor args for the last-resort attempt (see ``EMBEDDED_CLIENTS``)."""
+    return {**pot_provider_args(bgutil_http, bgutil_script),
+            "youtube": {"player_client": list(EMBEDDED_CLIENTS)}}

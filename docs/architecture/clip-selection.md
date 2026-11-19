@@ -47,7 +47,9 @@ window. A source longer than `VISION_SEGMENT_SECONDS` (2400) is therefore split 
 each re-encoded to a 360p / 1 fps proxy (`_vision_proxy`: re-encoded, not
 stream-copied, or every timestamp would be off by up to a GOP), watched on its
 own, offset back to source time, then merged with `dedupe_overlapping` +
-`trim_to_best` to `CLIP_TARGET_MAX`. One failed stretch is logged and skipped.
+`trim_to_best` to `CLIP_TARGET_MAX`. A busy model (503, 429, an empty body) is tried again on the same upload
+(`VISION_RETRY_WAITS`, 10 s then 30 s); a stretch that still fails is logged
+and skipped.
 `VISION_MAX_SEGMENTS` (8, ~5 h 20) bounds the spend of one job; past it only the
 first stretches are watched. A source that fits one stretch is one stretch: it
 goes through the same proxy, never as the raw file (a broken capture, such as an

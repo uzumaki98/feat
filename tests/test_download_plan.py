@@ -29,21 +29,35 @@ class TestOrdering:
             ('fallback-static', False, "http://s1"),
             ('HD', True, PAID),
             ('fallback', True, PAID),
+            ('embedded', False, "http://s1"),
         ]
 
     def test_statics_only_fallback_uses_a_static(self):
         got = plan(False, STATICS, None, True)
-        assert got[-1] == ('fallback', False, "http://s1")
+        assert got[-2:] == [('fallback', False, "http://s1"),
+                            ('embedded', False, "http://s1")]
         assert ('HD', False, None) in got  # direct HD still tried, uncapped
 
     def test_selfhost_no_proxies_matches_legacy_chain(self):
         assert plan(False, [], None, True) == [
             ('HD', False, None),
             ('fallback', False, None),
+            ('embedded', False, None),
         ]
 
     def test_no_hd_args_still_has_fallback(self):
+        # Paid route, no statics, no DIRECT_FIRST: the server's own IP was
+        # being kept off YouTube, so no anonymous embedded attempt from it.
         assert plan(False, [], PAID, False) == [('fallback', True, PAID)]
+        assert plan(True, [], PAID, True)[-1] == ('embedded', False, None)
+
+    def test_embedded_is_last_and_never_on_the_paid_proxy(self):
+        for args in ((True, STATICS, PAID, True), (True, [], PAID, True),
+                     (False, STATICS, None, True), (False, [], None, False)):
+            got = plan(*args)
+            assert [a for a in got if a[0] == 'embedded'] == [got[-1]]
+            _label, capped, proxy = got[-1]
+            assert not capped and proxy != PAID
 
     def test_paid_attempts_are_the_only_capped_ones(self):
         got = plan(True, STATICS, PAID, True)
@@ -56,7 +70,7 @@ def test_fallback_static_only_exists_when_paid_is_configured():
     # a fallback-static before it would be the same attempt twice.
     got = plan(False, STATICS, None, True)
     assert ('fallback-static', False, "http://s1") not in got
-    assert got[-1] == ('fallback', False, "http://s1")
+    assert got[-2] == ('fallback', False, "http://s1")
 
 
 def test_direct_file_urls_skip_the_proxy_chain():

@@ -725,7 +725,8 @@ def plan_download_attempts(direct_first, statics, paid, have_hd, youtube=True,
         if statics:
             plan.append(('static-fallback', False, statics[0]))
         return plan
-    if skip_statics and paid:
+    straight_to_paid = bool(skip_statics and paid)
+    if straight_to_paid:
         statics, direct_first = [], False
     plan = []
     if direct_first:
@@ -745,6 +746,19 @@ def plan_download_attempts(direct_first, statics, paid, have_hd, youtube=True,
         plan.append(('HD', bool(paid), paid))
     plan.append(('fallback', bool(paid),
                  paid if paid else (statics[0] if statics else None)))
+    if not straight_to_paid:
+        # Last resort, on free bytes only (own IP or a static, never the
+        # per-GB proxy): the embedded player's client. On an address YouTube
+        # is throttling, the list above gets its media cut with a 403 some
+        # 20 MB in, on every retry, while this client downloads the same
+        # 1080p file whole (16-nov-2026, a home connection without cookies).
+        # Never anonymous from a server's own IP that the plan was keeping
+        # off YouTube (a paid route and no DIRECT_FIRST): a static, else
+        # direct only where direct is already part of the plan.
+        if statics:
+            plan.append(('embedded', False, statics[0]))
+        elif direct_first or not paid:
+            plan.append(('embedded', False, None))
     return plan
 
 
@@ -950,9 +964,10 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
     # explicit `default,mweb` because the authed defaults alone return
     # "Video unavailable" on a share of videos, from every IP, and that was
     # what fed the per-GB proxy (6-sep-2026, verified in the prod container).
-    from yt_clients import hd_extractor_args, fallback_extractor_args
+    from yt_clients import hd_extractor_args, fallback_extractor_args, embedded_extractor_args
     hd_args = hd_extractor_args(_bgutil_http, _bgutil_script)
     fallback_args = fallback_extractor_args(_bgutil_http, _bgutil_script)
+    embedded_args = embedded_extractor_args(_bgutil_http, _bgutil_script)
 
     # Cap at 720p ONLY when the bytes actually go through the PER-GB paid proxy
     # — that cap exists to control bandwidth cost, and the direct attempt and
@@ -1060,6 +1075,119 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
             print(f"   ℹ️ Early audio skipped ({type(e).__name__}: {e}) — "
                   f"transcribing once the video is in.")
 
+    def _live_head(extractor_args, fmt, proxy, cookies, sanitized):
+        """A stream that is still live: its first ``_range_cap`` seconds,
+        fetched from the start of the broadcast as fast as the CDN serves
+        them, instead of recording the live edge in real time. Returns None
+        when this broadcast cannot be fetched from its start (the caller then
+        takes the ordinary path).
+
+        yt-dlp refuses a time range on a from-start live download ("This
+        format cannot be partially downloaded"), so each stream is stopped
+        by fragment count (fragment index x the format's target duration)
+        and the two partial files are merged here. Measured 19-nov-2026 on a
+        stream 18 h in: 1 min of 1080p60 in ~40 s from a home connection."""
+        base = os.path.join(output_dir, f'{sanitized}.live')
+        stem = os.path.basename(base) + '.'
+        parts = {}
+        got = {}
+        started = time.time()
+
+        def _hook(d):
+            fi = d.get('info_dict') or {}
+            tmp = d.get('tmpfilename') or d.get('filename')
+            key = str(fi.get('format_id') or tmp)
+            if tmp:
+                parts[key] = (tmp, (fi.get('vcodec') or 'none') != 'none')
+            got[key] = int(d.get('downloaded_bytes') or 0)
+            idx = d.get('fragment_index')
+            try:
+                step = float(fi.get('target_duration') or 2.0)
+            except (TypeError, ValueError):
+                step = 2.0
+            if idx and idx * step >= _range_cap:
+                raise yt_dlp.utils.DownloadCancelled('live head reached')
+            # Backstop: fetching from the start runs many times faster than
+            # real time. Taking as long as the cap means this is recording the
+            # live edge after all; stop rather than run until the broadcast ends.
+            if time.time() - started > _range_cap * 1.2:
+                raise yt_dlp.utils.DownloadCancelled('live head reached (time limit)')
+
+        opts = {
+            **_base_opts(extractor_args, proxy, cookies),
+            'format': fmt, 'live_from_start': True,
+            'outtmpl': base + '.%(ext)s', 'overwrites': True,
+            'progress_hooks': [_hook, _progress_hook],
+            # One fragment at a time on purpose: with concurrent fragments the
+            # hook's cancel is raised in a worker thread and swallowed, and the
+            # download ran on past the cap until it was killed (19-nov-2026).
+            'concurrent_fragment_downloads': 1,
+        }
+        try:
+            with (yt_session.request() if (cookies and cookies_path) else contextlib.nullcontext()):
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    picked = ydl.extract_info(url, download=False)
+                    chosen = picked.get('requested_formats') or [picked]
+                    # Only the from-start DASH fragments report fragment_index
+                    # and start at the beginning; anything else (an HLS live
+                    # format, a stream without DVR) would record the live edge.
+                    if not all(str(f.get('protocol') or '') == 'http_dash_segments_generator'
+                               for f in chosen):
+                        print("ℹ️ This live stream cannot be fetched from its start; "
+                              "downloading it the ordinary way.")
+                        return None
+                    print(f"🔴 Live stream: downloading its first {_range_cap / 60:.0f} min "
+                          f"from the start of the broadcast (no need to wait for it to end).")
+                    ydl.process_ie_result(picked, download=True)
+        except yt_dlp.utils.DownloadCancelled:
+            pass
+        except yt_dlp.utils.DownloadError as e:
+            if 'live head reached' not in str(e):
+                raise
+        finally:
+            # What actually crossed the wire, per stream: one shared counter
+            # kept only the last stream's bytes for the per-GB ledger.
+            if got:
+                _dl_bytes["total"], _dl_bytes["partial"] = sum(got.values()), 0
+        video = next((p for p, is_v in parts.values() if is_v and os.path.exists(p)), None)
+        audio = next((p for p, is_v in parts.values() if not is_v and os.path.exists(p)), None)
+        if not video:
+            # The broadcast ended before the cap: yt-dlp finished normally and
+            # merged the streams itself under the base name.
+            done = [f for f in os.listdir(output_dir)
+                    if f.startswith(stem) and f[len(stem):] in ('mp4', 'mkv', 'webm')]
+            if done:
+                video, audio = os.path.join(output_dir, done[0]), None
+        if not video:
+            raise RuntimeError("The live stream's video could not be downloaded from its start.")
+        target = os.path.join(output_dir, f'{sanitized}.mp4')
+        cmd = ['ffmpeg', '-y', '-v', 'error', '-i', video]
+        if audio:
+            cmd += ['-i', audio, '-map', '0:v:0', '-map', '1:a:0']
+        cmd += ['-c', 'copy', '-t', f'{_range_cap:.3f}', '-movflags', '+faststart', target]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0 or not os.path.exists(target):
+            raise RuntimeError(f"Could not assemble the live stream's start: {res.stderr[-300:]}")
+        for leftover in os.listdir(output_dir):
+            if leftover.startswith(stem):
+                try:
+                    os.remove(os.path.join(output_dir, leftover))
+                except OSError:
+                    pass
+        got_s = None
+        try:
+            probe = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                                    '-of', 'csv=p=0', target], capture_output=True, text=True)
+            got_s = float(probe.stdout.strip())
+        except (OSError, ValueError):
+            pass
+        if got_s is not None and got_s < 0.9 * _range_cap:
+            print(f"⚠️ Live stream: only {got_s / 60:.1f} of {_range_cap / 60:.0f} min came "
+                  f"down (a shorter broadcast, or segments longer than assumed).")
+        print(f"✅ Live stream: {(got_s if got_s is not None else _range_cap) / 60:.1f} min "
+              f"from the start assembled.")
+        return sanitized
+
     def _attempt(extractor_args, fmt, proxy, cookies=True):
         _dl_bytes["total"] = 0
         _dl_bytes["partial"] = 0
@@ -1079,6 +1207,14 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
             import ssrf_guard
             ssrf_guard.assert_public_urls(info)
         sanitized = sanitize_filename(info.get('title', 'youtube_video'))
+        # A broadcast still on air with a cap on what is processed: take its
+        # beginning, now, rather than recording the live edge for the length
+        # of the cap. Without a cap the old behaviour stays.
+        if (info.get('live_status') == 'is_live' and _range_cap
+                and str(info.get('extractor_key') or '').lower().startswith('youtube')):
+            got = _live_head(extractor_args, fmt, proxy, cookies, sanitized)
+            if got is not None:
+                return got
         # Only when the whole source is far bigger than what was paid for: a
         # ranged fetch goes through ffmpeg at ~1-2.5x realtime, while a native
         # download of a source a bit over the cap takes seconds. A 21-min video
@@ -1139,10 +1275,13 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
               "downloading through the paid proxy directly.")
     attempts = [
         (label,
+         embedded_args if label == 'embedded' else
          fallback_args if label.startswith('fallback') else hd_args,
          _hd_fmt_for(capped),
          proxy,
-         not (label.startswith('fallback') and hd_args))
+         # The embedded attempt is always anonymous: it is there for when
+         # everything before it, cookies included, was refused.
+         label != 'embedded' and not (label.startswith('fallback') and hd_args))
         for label, capped, proxy in plan_download_attempts(
             _direct_first, _statics, _proxy, bool(hd_args), youtube=is_youtube_url(url),
             skip_statics=_skip_statics)
@@ -1997,6 +2136,23 @@ def transcribe_video(video_path):
 
     return transcript
 
+_TRANSIENT_MODEL_ERRORS = (
+    '503', 'UNAVAILABLE', '429', 'RESOURCE_EXHAUSTED',
+    '500', 'INTERNAL', 'overloaded', 'Deadline',
+    'empty response body', 'did not contain a JSON object',
+    'Failed to parse Gemini JSON response',
+    # OpenAI-compatible servers: model still loading, busy, or a
+    # small model that skipped a required field this time.
+    'ConnectError', 'ReadTimeout', 'RemoteProtocolError', '502', '504',
+    'validation error')
+
+
+def model_error_is_transient(message):
+    """Whether a model call's error text is one the same call can get past
+    on another try (busy model, rate limit, empty or truncated body)."""
+    return any(tok in str(message) for tok in _TRANSIENT_MODEL_ERRORS)
+
+
 def _run_gemini_stage(client, model_name, prompt, schema):
     """One schema-enforced model call with transient-error backoff.
     Returns (parsed_dict, cost_analysis).
@@ -2011,7 +2167,7 @@ def _run_gemini_stage(client, model_name, prompt, schema):
         response_mime_type="application/json",
         response_schema=schema,
     )
-    max_attempts = 3
+    max_attempts = 5
     for attempt in range(1, max_attempts + 1):
         try:
             if use_local:
@@ -2036,18 +2192,10 @@ def _run_gemini_stage(client, model_name, prompt, schema):
             raise  # deterministic policy block — never retry
         except Exception as e:
             msg = str(e)
-            transient = any(tok in msg for tok in (
-                '503', 'UNAVAILABLE', '429', 'RESOURCE_EXHAUSTED',
-                '500', 'INTERNAL', 'overloaded', 'Deadline',
-                'empty response body', 'did not contain a JSON object',
-                'Failed to parse Gemini JSON response',
-                # OpenAI-compatible servers: model still loading, busy, or a
-                # small model that skipped a required field this time.
-                'ConnectError', 'ReadTimeout', 'RemoteProtocolError', '502', '504',
-                'validation error'))
+            transient = model_error_is_transient(msg)
             if attempt == max_attempts or not transient:
                 raise
-            wait = 5 * (2 ** (attempt - 1))
+            wait = gemini_worker.retry_wait(msg, attempt - 1)
             who = "LLM server" if use_local else "Gemini"
             print(f"⚠️ {who} transient error (attempt {attempt}/{max_attempts}), retrying in {wait}s: {msg[:150]}")
             time.sleep(wait)
@@ -2368,6 +2516,11 @@ def _viewer_hint(viewer_clips, offset, duration):
             "but still judge what you see and keep the time contract.\n")
 
 
+# Seconds to wait before each further try of the vision call. Longer than the
+# text stages' 5 + 10: "high demand" on a video call takes longer to clear.
+VISION_RETRY_WAITS = (10, 30)
+
+
 def _visual_pass(client, model_name, video_path, duration, language,
                  min_clips, max_clips, min_secs, max_secs, hint=""):
     """One vision call over one file. Returns ``(shorts, cost)``; ``shorts``
@@ -2398,10 +2551,30 @@ def _visual_pass(client, model_name, video_path, duration, language,
             response_mime_type="application/json",
             response_schema=gemini_worker.VisualResponse,
         )
-        response = client.models.generate_content(
-            model=model_name, contents=[file_upload, prompt], config=config)
-        gemini_worker.raise_if_blocked(response)
-        parsed = json.loads(response.text)
+        # The upload above is kept across tries: only the model call repeats.
+        # A busy model (503 "high demand") used to fail the whole job on a
+        # video with one stretch, minutes after a download and a transcription
+        # that had worked (16-nov-2026). An empty body fails in json.loads,
+        # so parsing is inside the loop, as in _run_gemini_stage.
+        waits = VISION_RETRY_WAITS
+        for attempt in range(len(waits) + 1):
+            try:
+                response = client.models.generate_content(
+                    model=model_name, contents=[file_upload, prompt], config=config)
+                gemini_worker.raise_if_blocked(response)
+                parsed = json.loads(response.text or "")
+                break
+            except gemini_worker.GeminiBlockedError:
+                raise  # deterministic policy block: never retry
+            except Exception as e:
+                empty = isinstance(e, (json.JSONDecodeError, TypeError))
+                if attempt == len(waits) or not (empty or model_error_is_transient(e)):
+                    raise
+                wait = max(waits[attempt], gemini_worker.retry_wait(e, attempt))
+                print(f"⚠️ Gemini transient error on the vision pass (attempt "
+                      f"{attempt + 1}/{len(waits) + 1}), retrying in "
+                      f"{wait:.0f}s: {str(e)[:150]}")
+                time.sleep(wait)
         clean = []
         for s in parsed.get("shorts") or []:
             s["start"] = max(0.0, float(s.get("start", 0)))
@@ -2843,6 +3016,42 @@ if __name__ == '__main__':
             # Save metadata. Silent videos have no transcript → no subtitles,
             # which is correct (there's no speech to caption).
             clips_data['transcript'] = transcript or {"language": "none", "segments": []}
+
+            # YouTube Shorts copy is made safe in code (the model is not
+            # trusted): title length, description, #Shorts, clean hashtags.
+            for _c in clips_data['shorts']:
+                gemini_worker.normalize_youtube_copy(_c)
+
+            # RATE_CLIPS=1: every candidate is rated on a fixed rubric
+            # (clip_rating.py) before anything renders. RENDER_TOP_N=n: only
+            # the n best are rendered; all candidates stay in the metadata
+            # under "candidates" with their rank. Both off: unchanged.
+            _rate = os.environ.get("RATE_CLIPS", "").strip() == "1"
+            try:
+                _top_n = max(0, int(os.environ.get("RENDER_TOP_N", "0") or 0))
+            except ValueError:
+                _top_n = 0
+            if _rate or _top_n:
+                import clip_rating
+                _all = clips_data['shorts']
+                for _k, _c in enumerate(_all):
+                    _c['candidate_index'] = _k + 1
+                if _rate:
+                    _rating_costs = clip_rating.rate_candidates(
+                        _all, clips_data['transcript'], input_video)
+                    _rc = _sum_costs(_rating_costs, os.environ.get("RATING_MODEL")
+                                     or os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite')
+                    if _rc:
+                        clips_data['rating_cost_analysis'] = _rc
+                _order = clip_rating.select_top(_all, len(_all))
+                for _rank, _k in enumerate(_order, 1):
+                    _all[_k]['rank'] = _rank
+                clips_data['candidates'] = _all
+                if _top_n:
+                    clips_data['shorts'] = [_all[_k] for _k in _order[:_top_n]]
+                    print(f"🏆 Rendering the top {len(clips_data['shorts'])} of "
+                          f"{len(_all)} candidates: "
+                          + ", ".join(f"#{c['candidate_index']}" for c in clips_data['shorts']))
             # The clip editor's re-render path needs to find the source video
             # again and reproduce the render settings, so record both. The
             # basename is enough — the file sits in the job dir (URL jobs with
@@ -2893,7 +3102,17 @@ if __name__ == '__main__':
                     # render put this clip's meaning on the screen, rewrite hook
                     # and title from three of its frames BEFORE burning them.
                     if success and hook_grounding.wanted(clip['layout_ranges'], end - start):
+                        _old_title = clip.get('video_title_for_youtube_short') or ''
                         hook_grounding.reground(clip_final_path, clip, transcript, start, end)
+                        # The title may have changed. A description that was only
+                        # the old title plus tags (normalize's fallback) is rebuilt
+                        # from the new one; normalize appends the hashtags again.
+                        _desc = clip.get('video_description_for_youtube_short') or ''
+                        if (_old_title and _desc.startswith(_old_title)
+                                and clip.get('video_title_for_youtube_short') != _old_title
+                                and all(w.startswith('#') for w in _desc[len(_old_title):].split())):
+                            clip['video_description_for_youtube_short'] = ''
+                        gemini_worker.normalize_youtube_copy(clip)
                     captioned = None
                     split_ranges = _layouts.split_ranges(clip['layout_ranges'])
                     if success and os.environ.get("AUTO_HOOK") == "1":
@@ -2974,7 +3193,7 @@ if __name__ == '__main__':
 
             # Persist per-clip render results added by the workers (auto_hook)
             # so the editor can see what is already burned into each clip.
-            if any('auto_hook' in c or 'hook_grounding' in c for c in shorts):
+            if 'candidates' in clips_data or any('auto_hook' in c or 'hook_grounding' in c for c in shorts):
                 # Atomic: the dashboard is already reading this file for the
                 # clips announced above (CLIP_READY).
                 write_json_atomic(metadata_file, clips_data, indent=2)
