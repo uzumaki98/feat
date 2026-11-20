@@ -9,7 +9,8 @@ chunk), ``chunk_NN/fetched.json`` (that chunk's ``source.mp4`` is complete) and
 ``fetch.log`` (``all chunks fetched`` at the end). Each fetched chunk gets one
 ``shorts_pipeline.py --input chunk_NN/source.mp4 --out chunk_NN`` child, at most
 ``--jobs`` at once, in chunk order, with ``ASR_HOST_SLOTS=<jobs>`` so every
-child may transcribe at the same time.
+child may transcribe at the same time (never more than an ``ASR_HOST_SLOTS``
+the host already sets: a small GPU fits one transcription).
 
 Markers in each chunk dir: ``batch_running.json`` while a child runs (batch pid
 and child pid; one left by a dead earlier run is started again),
@@ -225,8 +226,19 @@ def child_command(url, out, chunk, top, clip_workers=None, python=None):
 
 
 def child_env(jobs, base=None):
+    """The children's env: as many GPU transcription slots as jobs, unless
+    the host already caps them lower (a small card sets ASR_HOST_SLOTS=1, and
+    five chunks transcribing at once would not fit its memory). On CPU the
+    slots gate nothing."""
     env = dict(os.environ if base is None else base)
-    env["ASR_HOST_SLOTS"] = str(int(jobs))
+    slots = int(jobs)
+    try:
+        cap = int(str(env.get("ASR_HOST_SLOTS", "")).strip())
+        if cap > 0:
+            slots = min(slots, cap)
+    except ValueError:
+        pass
+    env["ASR_HOST_SLOTS"] = str(slots)
     env.setdefault("PYTHONUNBUFFERED", "1")
     return env
 

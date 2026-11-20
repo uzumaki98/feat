@@ -222,7 +222,8 @@ def test_resumes_after_dead_running_marker(tmp_path):
     assert running["child_pid"] == fp.procs[0].pid
 
 
-def test_child_command_and_env(tmp_path):
+def test_child_command_and_env(tmp_path, monkeypatch):
+    monkeypatch.delenv("ASR_HOST_SLOTS", raising=False)  # a GPU host sets its own cap
     out = str(tmp_path)
     make_plan(out, 1, seconds=5401.0)
     fetch(out, 1)
@@ -303,3 +304,10 @@ def test_finished_orphan_is_adopted(tmp_path):
     done = _json.loads((c / "batch_done.json").read_text())
     assert done["completed"] and done["adopted"]
     assert not (c / "batch_running.json").exists()
+
+
+def test_gpu_slots_never_exceed_the_host_cap():
+    assert sb.child_env(5, base={})["ASR_HOST_SLOTS"] == "5"
+    assert sb.child_env(5, base={"ASR_HOST_SLOTS": "1"})["ASR_HOST_SLOTS"] == "1"
+    assert sb.child_env(2, base={"ASR_HOST_SLOTS": "4"})["ASR_HOST_SLOTS"] == "2"
+    assert sb.child_env(3, base={"ASR_HOST_SLOTS": "x"})["ASR_HOST_SLOTS"] == "3"
