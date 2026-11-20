@@ -52,6 +52,16 @@ Stages, each re-runnable on an existing out dir:
   largest window inside it. Punch-ins then zoom only the gameplay band
   (`zoom_from`). No webcam, an already vertical source or any failure: the
   clip keeps main.py's framing; `edits.json` records `layout` per short.
+- **English letters only** (`latin_text.py`, `--script latin`, the default;
+  `any` keeps the speech's script): the speech can be Hindi, but what the
+  viewer reads is in Latin letters. The edit stage romanises the caption words
+  one for one (timings kept) and the hook, as Hinglish ("bahut ganda maar
+  diya"); the package stage rewrites a title, description or hashtag that is
+  not Latin in English. Gemini does both when a key is there; every answer is
+  checked in code (same word count, Latin letters only) and anything failing
+  falls back to a fixed Devanagari table, so the output is always Latin. Copy
+  and words already in Latin letters never call Gemini. The dashboard path is
+  unchanged.
 - **verify** (`verify_shorts.py`): per rendered short (the edit when there is
   one, checked against its own captions and words), 9:16, 5-60 s, video and
   audio streams, a clean full decode, loudness (informational, -14 LUFS ±3),

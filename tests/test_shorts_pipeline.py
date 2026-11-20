@@ -442,3 +442,68 @@ class TestEdit:
         meta["source_live_status"] = "was_live"
         (job / f"{TITLE}_metadata.json").write_text(json.dumps(meta))
         assert run_edit() is True                        # a URL run of a stream VOD
+
+
+class TestLatinScript:
+    """Captions, hook and copy in English letters when the speech is Hindi."""
+
+    @staticmethod
+    def _hindi(job):
+        md = _metadata()
+        md["shorts"][0].update(video_title_for_youtube_short="बहुत गंदा मार दिया!",
+                               video_description_for_youtube_short="लूट का मजा",
+                               youtube_hashtags=["#GTA5"], viral_hook_text="बहुत गंदा")
+        md["transcript"]["segments"][0]["words"] = [
+            {"word": "बहुत", "start": 100.2, "end": 100.5},
+            {"word": "मार", "start": 100.6, "end": 101.0}]
+        (job / f"{TITLE}_metadata.json").write_text(json.dumps(md), encoding="utf-8")
+        (job / f"{TITLE}_clip_1.mp4").write_bytes(b"clean one")
+
+    def test_edit_gets_latin_words_and_hook(self, job):
+        import latin_text
+        self._hindi(job)
+        calls = []
+        sp.edit_stage(str(job), editor=TestEdit._editor(calls), say=lambda *_: None,
+                      latin=latin_text.Latinizer(client=False))
+        assert calls[0]["hook"] == "bahut ganda"
+        assert calls[0]["words"] == [{"word": "bahut", "start": 0.2, "end": 0.5},
+                                     {"word": "mar", "start": 0.6, "end": 1.0}]
+
+    def test_edit_keeps_the_script_when_asked(self, job):
+        self._hindi(job)
+        calls = []
+        sp.edit_stage(str(job), editor=TestEdit._editor(calls), say=lambda *_: None,
+                      latin=False)
+        assert calls[0]["hook"] == "बहुत गंदा"
+
+    def test_latin_job_never_makes_a_latinizer(self, job, monkeypatch):
+        import latin_text
+
+        def boom(*a, **k):
+            raise AssertionError("Latinizer built for Latin text")
+        monkeypatch.setattr(latin_text, "Latinizer", boom)
+        sp.edit_stage(str(job), editor=TestEdit._editor([]), say=lambda *_: None)
+        sp.package_stage(str(job))
+
+    def test_package_copy_in_english_letters(self, job):
+        import latin_text
+        self._hindi(job)
+
+        class Fake(latin_text.Latinizer):
+            def __init__(self):
+                super().__init__(client=False)
+                self.context = None
+
+            def english_copy(self, title, description, hashtags, context=""):
+                self.context = context
+                return "He wrecked them!", "Pure chaos.", ["#GTA6", "#Shorts", "#Funny"]
+        fake = Fake()
+        sp.package_stage(str(job), latin=fake)
+        d1 = job / "publish" / "short_1"
+        assert (d1 / "title.txt").read_text(encoding="utf-8") == "He wrecked them!\n"
+        assert (d1 / "hashtags.txt").read_text(encoding="utf-8") == "#GTA6 #Funny #Shorts\n"
+        desc = (d1 / "description.txt").read_text(encoding="utf-8")
+        assert desc.startswith("Pure chaos.") and "#Shorts" in desc
+        assert TITLE in fake.context
+        meta = json.loads((d1 / "metadata.json").read_text(encoding="utf-8"))
+        assert meta["title"] == "He wrecked them!"

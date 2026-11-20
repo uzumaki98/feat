@@ -297,14 +297,34 @@ def is_youtube_stream(out_dir, metadata):
         metadata.get("source_live_status") in STREAM_LIVE_STATUSES
 
 
+class _LazyLatin:
+    """latin_text.Latinizer made on first use only: Latin text never builds a
+    Gemini client. ``latin=False`` keeps every script as it is."""
+
+    def __init__(self, latin=None, say=None):
+        self.given, self.say, self.made = latin, say, None
+
+    def get(self):
+        if self.given is not None:
+            return self.given
+        if self.made is None:
+            import latin_text
+            self.made = latin_text.Latinizer(say=self.say)
+        return self.made
+
+
 def edit_stage(out_dir, style="full", editor=None, say=None, template="facecam",
-               framer=None):
+               framer=None, latin=None):
     """The house edit on every rendered short (see the module docstring).
     ``editor`` is shorts_variants.full_edit, ``framer`` facecam_template.frame
     (tests pass fakes). ``template="facecam"``: a clip whose source stretch has
     a streamer webcam is re-framed from the source, camera on top and gameplay
-    below, before the edit; any other clip keeps main.py's framing."""
+    below, before the edit; any other clip keeps main.py's framing.
+    Captions and the hook are written in Latin letters (``latin``: a
+    latin_text.Latinizer; False keeps the transcript's own script)."""
     say = say or _say
+    import latin_text
+    lazy = _LazyLatin(latin, say)
     record = {"style": style, "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
               "shorts": {}, "errors": []}
     path = os.path.join(out_dir, EDITS_FILE)
@@ -348,9 +368,12 @@ def edit_stage(out_dir, style="full", editor=None, say=None, template="facecam",
             if framed:
                 clip, extra = framed[0], {"zoom_from": framed[1]}
                 layout = "facecam"
+        cwords, hook = clip_words(words, cand["start"], cand["end"]), cand["hook"] or ""
+        if latin is not False and not (all(latin_text.is_latin(w["word"]) for w in cwords)
+                                       and latin_text.is_latin(hook)):
+            cwords, hook = lazy.get().caption_words(cwords), lazy.get().text(hook)
         try:
-            done = editor(clip, clip_words(words, cand["start"], cand["end"]),
-                          cand["hook"] or "", os.path.join(out_dir, name), work, **extra)
+            done = editor(clip, cwords, hook, os.path.join(out_dir, name), work, **extra)
         except Exception as e:  # keep main.py's render for this one
             record["errors"].append(f"edit: short rank {item['rank']}: "
                                     f"{type(e).__name__}: {e}"[:400])
@@ -472,8 +495,26 @@ def _verification_summary(row):
     }
 
 
-def package_stage(out_dir):
+def _latin_copy(cand, lazy, context):
+    """cand's title/description/hashtags in English letters (#Shorts last)."""
+    import latin_text
+    desc = cand["description"] if isinstance(cand["description"], str) else ""
+    tags = list(cand["hashtags"] or [])
+    if latin_text.is_latin(cand["title"]) and latin_text.is_latin(desc) and \
+            all(latin_text.is_latin(t) for t in tags):
+        return cand["title"], desc, tags
+    title, desc, tags = lazy.get().english_copy(cand["title"], desc, tags, context)
+    tags = [t for t in tags if t.lower() != "#shorts"][:5] + ["#Shorts"]
+    if "#shorts" not in desc.lower():
+        desc = (desc + " " + " ".join(tags)).strip()
+    return title or cand["title"], desc, tags
+
+
+def package_stage(out_dir, latin=None):
+    """``latin``: a latin_text.Latinizer for copy that is not in Latin
+    letters (None: made when needed; False: keep the copy as it is)."""
     metadata, title, meta_name = load_job(out_dir)
+    lazy = _LazyLatin(latin)
     ver = sr.load_json(os.path.join(out_dir, sr.VERIFICATION_FILE))
     ver_rows = {}
     for row in (ver or {}).get("shorts", []) if isinstance(ver, dict) else []:
@@ -513,6 +554,9 @@ def package_stage(out_dir):
         _place(src, os.path.join(dest, video))
         digest = _sha256(os.path.join(dest, video))
         description = cand["description"] if isinstance(cand["description"], str) else ""
+        if latin is not False:
+            cand["title"], description, cand["hashtags"] = _latin_copy(
+                cand, lazy, f"Source video title: {title or ''}. Hook: {cand['hook'] or ''}")
         with open(os.path.join(dest, "title.txt"), "w", encoding="utf-8") as f:
             f.write(cand["title"] + "\n")
         with open(os.path.join(dest, "description.txt"), "w", encoding="utf-8") as f:
@@ -618,6 +662,9 @@ def main(argv=None):
     p.add_argument("--stream", action="store_true",
                    help="run: the input is (a piece of) a live stream's recording "
                         "(stream_batch sets it); a URL run learns it from YouTube")
+    p.add_argument("--script", choices=("latin", "any"), default="latin",
+                   help="edit/package: captions, hook, title and description in "
+                        "English letters (latin, the default) or the speech's own script")
     p.add_argument("--template", choices=("facecam", "none"), default="facecam",
                    help="edit stage: streamer webcam on top, gameplay below, where the "
                         "source has a webcam (facecam), or main.py's framing (none)")
@@ -660,7 +707,8 @@ def main(argv=None):
                 if state.get("exit_code") != 0:
                     failed.append(stage)
             elif stage == "edit":
-                if edit_stage(out_dir, args.edit, template=args.template)["errors"]:
+                if edit_stage(out_dir, args.edit, template=args.template,
+                              latin=None if args.script == "latin" else False)["errors"]:
                     failed.append(stage)
             elif stage == "verify":
                 data = verify_stage(out_dir, args.max_seconds, args.min_seconds)
@@ -670,7 +718,7 @@ def main(argv=None):
             elif stage == "report":
                 report_stage(out_dir)
             elif stage == "package":
-                approval = package_stage(out_dir)
+                approval = package_stage(out_dir, latin=None if args.script == "latin" else False)
                 if approval["errors"] or not approval["shorts"]:
                     failed.append(stage)
         except Exception as e:  # later stages still run on whatever exists
