@@ -878,6 +878,11 @@ def _content_block(error_text):
     return None
 
 
+# What the last download's extraction said about its source (live status),
+# for the metadata: the Shorts runner frames stream VODs differently.
+SOURCE_FACTS = {}
+
+
 def download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
                            cap_minutes=None, route_out=None):
     """Download ``url`` with only public addresses resolvable (ssrf_guard): the
@@ -1207,6 +1212,9 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
             import ssrf_guard
             ssrf_guard.assert_public_urls(info)
         sanitized = sanitize_filename(info.get('title', 'youtube_video'))
+        SOURCE_FACTS.update(
+            live_status=str(info.get('live_status') or '')[:20] or None,
+            extractor=str(info.get('extractor_key') or info.get('ie_key') or '')[:40] or None)
         # A broadcast still on air with a cap on what is processed: take its
         # beginning, now, rather than recording the live edge for the length
         # of the cap. Without a cap the old behaviour stays.
@@ -3057,6 +3065,8 @@ if __name__ == '__main__':
             # basename is enough — the file sits in the job dir (URL jobs with
             # --keep-original) or in uploads/ (upload jobs).
             clips_data['source_video'] = os.path.basename(input_video)
+            if SOURCE_FACTS.get('live_status'):
+                clips_data['source_live_status'] = SOURCE_FACTS['live_status']
             clips_data['output_format'] = output_format
             if source_subtitle_band:
                 clips_data['source_subtitle_band'] = source_subtitle_band

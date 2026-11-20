@@ -142,7 +142,8 @@ def main_command(url, out_dir, input_path=None):
 
 
 def run_stage(url, out_dir, minutes, top, model=None, clip_workers=None,
-              popen=subprocess.Popen, clock=time.monotonic, input_path=None):
+              popen=subprocess.Popen, clock=time.monotonic, input_path=None,
+              stream=False):
     """Run main.py, stream and stamp its output, record stages. Returns the
     StageTracker summary dict written to stages.json."""
     os.makedirs(out_dir, exist_ok=True)
@@ -161,7 +162,8 @@ def run_stage(url, out_dir, minutes, top, model=None, clip_workers=None,
 
     _write_json(os.path.join(out_dir, sr.RUN_FILE), {
         "url": url, "minutes": minutes, "top": top, "model": model,
-        "clip_workers": clip_workers, "started_at": state["started_at"]})
+        "clip_workers": clip_workers, "started_at": state["started_at"],
+        "stream": bool(stream)})
 
     cmd = main_command(url, os.path.abspath(out_dir),
                        os.path.abspath(input_path) if input_path else None)
@@ -277,9 +279,31 @@ def edit_words(out_dir, edit):
     return verify_shorts.transcript_words({"segments": [{"words": data}]})
 
 
-def edit_stage(out_dir, style="full", editor=None, say=None):
+STREAM_LIVE_STATUSES = ("is_live", "was_live", "post_live")
+_YOUTUBE_HOSTS = ("youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be")
+
+
+def is_youtube_stream(out_dir, metadata):
+    """True when the job's source is a YouTube live stream or its recording:
+    a YouTube URL, and either the runner was told so (``--stream``, set by
+    stream_batch) or the download saw a live status. The streamer template
+    is only for these; anything else keeps main.py's framing."""
+    run = sr.load_json(os.path.join(out_dir, sr.RUN_FILE))
+    run = run if isinstance(run, dict) else {}
+    host = (urlparse(str(run.get("url") or "")).hostname or "").lower()
+    if host not in _YOUTUBE_HOSTS:
+        return False
+    return run.get("stream") is True or \
+        metadata.get("source_live_status") in STREAM_LIVE_STATUSES
+
+
+def edit_stage(out_dir, style="full", editor=None, say=None, template="facecam",
+               framer=None):
     """The house edit on every rendered short (see the module docstring).
-    ``editor`` is shorts_variants.full_edit (a test passes a fake)."""
+    ``editor`` is shorts_variants.full_edit, ``framer`` facecam_template.frame
+    (tests pass fakes). ``template="facecam"``: a clip whose source stretch has
+    a streamer webcam is re-framed from the source, camera on top and gameplay
+    below, before the edit; any other clip keeps main.py's framing."""
     say = say or _say
     record = {"style": style, "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
               "shorts": {}, "errors": []}
@@ -293,6 +317,13 @@ def edit_stage(out_dir, style="full", editor=None, say=None):
         editor = shorts_variants.full_edit
     metadata, title, _ = load_job(out_dir)
     words = verify_shorts.transcript_words(metadata.get("transcript") or {})
+    source = None
+    if template == "facecam" and is_youtube_stream(out_dir, metadata):
+        name = sr.safe_basename(metadata.get("source_video"))
+        source = sr.resolve_in(out_dir, name) if name else None
+        if framer is None:
+            import facecam_template
+            framer = facecam_template.frame
     for item in rendered_shorts(out_dir, metadata, title):
         n = item["short_index"] + 1
         if not item["file"]:
@@ -305,15 +336,28 @@ def edit_stage(out_dir, style="full", editor=None, say=None):
         cand = sr.normalise_candidate(item["short"], item["short_index"])
         name = f"edited_clip_{n}.mp4"
         work = os.path.join(out_dir, f".edit_work_{n}")
+        layout, extra = "main", {}
+        if source:
+            try:
+                framed = framer(source, cand["start"], cand["end"],
+                                os.path.join(work, "template"))
+            except Exception as e:  # the template is a bonus, never a failure
+                framed = None
+                say(f"edit: rank {item['rank']} template skipped ({type(e).__name__}: "
+                    f"{str(e)[:120]})")
+            if framed:
+                clip, extra = framed[0], {"zoom_from": framed[1]}
+                layout = "facecam"
         try:
             done = editor(clip, clip_words(words, cand["start"], cand["end"]),
-                          cand["hook"] or "", os.path.join(out_dir, name), work)
+                          cand["hook"] or "", os.path.join(out_dir, name), work, **extra)
         except Exception as e:  # keep main.py's render for this one
             record["errors"].append(f"edit: short rank {item['rank']}: "
                                     f"{type(e).__name__}: {e}"[:400])
             say(f"edit: rank {item['rank']} failed, kept as rendered ({type(e).__name__})")
             continue
         entry = {"file": name, "source_file": item["file"], "captions": None,
+                 "layout": layout,
                  "words": f"edited_clip_{n}.words.json"}
         if done.get("captions") and os.path.isfile(done["captions"]):
             entry["captions"] = f"edited_clip_{n}.ass"
@@ -325,7 +369,7 @@ def edit_stage(out_dir, style="full", editor=None, say=None):
         record["shorts"][str(item["short_index"])] = entry
         _write_json(path, record)
         shutil.rmtree(work, ignore_errors=True)
-        say(f"edit: rank {item['rank']} -> {name} ({entry['seconds']}s)")
+        say(f"edit: rank {item['rank']} -> {name} ({entry['seconds']}s, {layout})")
     _write_json(path, record)
     return record
 
@@ -571,6 +615,12 @@ def main(argv=None):
                                    "downloading the URL (the URL is still recorded)")
     p.add_argument("--edit", choices=EDIT_STYLES, default="full",
                    help="edit stage: the house edit (full) or main.py's render as is (none)")
+    p.add_argument("--stream", action="store_true",
+                   help="run: the input is (a piece of) a live stream's recording "
+                        "(stream_batch sets it); a URL run learns it from YouTube")
+    p.add_argument("--template", choices=("facecam", "none"), default="facecam",
+                   help="edit stage: streamer webcam on top, gameplay below, where the "
+                        "source has a webcam (facecam), or main.py's framing (none)")
     p.add_argument("--max-seconds", type=float, default=60.0)
     p.add_argument("--min-seconds", type=float, default=5.0)
     args = p.parse_args(argv)
@@ -605,11 +655,12 @@ def main(argv=None):
         try:
             if stage == "run":
                 state = run_stage(args.url, out_dir, args.minutes, args.top,
-                                  args.model, args.clip_workers, input_path=args.input)
+                                  args.model, args.clip_workers, input_path=args.input,
+                                  stream=args.stream)
                 if state.get("exit_code") != 0:
                     failed.append(stage)
             elif stage == "edit":
-                if edit_stage(out_dir, args.edit)["errors"]:
+                if edit_stage(out_dir, args.edit, template=args.template)["errors"]:
                     failed.append(stage)
             elif stage == "verify":
                 data = verify_stage(out_dir, args.max_seconds, args.min_seconds)

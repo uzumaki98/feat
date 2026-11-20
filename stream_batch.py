@@ -218,7 +218,7 @@ def child_command(url, out, chunk, top, clip_workers=None, python=None):
     cmd = [python or sys.executable, os.path.join(REPO_DIR, "shorts_pipeline.py"), url,
            "--input", os.path.join(d, "source.mp4"),
            "--minutes", str(minutes_for(chunk["seconds"])),
-           "--top", str(int(top)), "--out", d]
+           "--top", str(int(top)), "--out", d, "--stream"]
     if clip_workers:
         cmd += ["--clip-workers", str(int(clip_workers))]
     return cmd

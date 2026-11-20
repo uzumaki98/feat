@@ -33,6 +33,25 @@ Stages, each re-runnable on an existing out dir:
   changes per frame (punch_in's sendcmd) segfaults the image's ffmpeg on CPU.
   `python shorts_variants.py --clip ... --hook ... --out ...` renders the plain
   (B) and full (C) edit of one clip side by side.
+  **Streamer template** (`facecam_template.py`, `--template facecam`, the
+  default; `none` keeps main.py's framing), **only for a YouTube live stream or
+  its recording** (`is_youtube_stream`: a YouTube URL in `run.json`, and either
+  `run.json["stream"]`, which `stream_batch` sets with `--stream` on every
+  chunk, or `metadata["source_live_status"]` in is_live / was_live /
+  post_live, which main.py records from its download's extraction). Any other
+  source, a non-stream YouTube video or another site's stream, keeps main.py's
+  framing even with a webcam in it. For a stream, before the edit, each short's span
+  is cut again from the horizontal source (`metadata["source_video"]`), and
+  when `camera_inset.detect` finds a webcam the clip is re-framed as the
+  stream-clip look: the webcam enlarged in the top 38% (`CAM_RATIO`), the
+  gameplay below at full height, centred on the side away from the webcam.
+  The detector grows a 16:9 box from the face, which on a stream overlay takes
+  in the counters and menus around the camera, so the box is snapped to the
+  camera's own border (`snap_box`: the time-averaged gradient peaks on the one
+  edge that stays put; no clear peak keeps the estimate), and the band is the
+  largest window inside it. Punch-ins then zoom only the gameplay band
+  (`zoom_from`). No webcam, an already vertical source or any failure: the
+  clip keeps main.py's framing; `edits.json` records `layout` per short.
 - **verify** (`verify_shorts.py`): per rendered short (the edit when there is
   one, checked against its own captions and words), 9:16, 5-60 s, video and
   audio streams, a clean full decode, loudness (informational, -14 LUFS ±3),

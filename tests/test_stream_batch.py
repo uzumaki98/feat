@@ -239,6 +239,7 @@ def test_child_command_and_env(tmp_path):
     assert cmd[cmd.index("--top") + 1] == "4"
     assert cmd[cmd.index("--out") + 1] == chunk_dir
     assert cmd[cmd.index("--clip-workers") + 1] == "2"
+    assert "--stream" in cmd  # every chunk is a piece of a live stream
     assert call["env"]["ASR_HOST_SLOTS"] == "3"
     assert call["cwd"] == sb.REPO_DIR
     assert os.path.exists(os.path.join(chunk_dir, "batch_child.log"))

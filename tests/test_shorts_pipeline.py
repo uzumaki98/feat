@@ -298,8 +298,9 @@ class TestEdit:
 
     @staticmethod
     def _editor(calls, fail_on=None):
-        def edit(clip, words, hook, out, work):
-            calls.append({"clip": os.path.basename(clip), "words": words, "hook": hook})
+        def edit(clip, words, hook, out, work, **kw):
+            calls.append({"clip": os.path.basename(clip), "words": words, "hook": hook,
+                          "kw": kw})
             if fail_on and fail_on in clip:
                 raise RuntimeError("ffmpeg failed")
             os.makedirs(work, exist_ok=True)
@@ -372,3 +373,72 @@ class TestEdit:
         assert sp.clip_words([{"word": "a", "start": 9.0, "end": 10.5},
                               {"word": "b", "start": 20.0, "end": 21.0}], 10.0, 20.0) \
             == [{"word": "a", "start": 0.0, "end": 0.5}]
+
+    @staticmethod
+    def _run(job, url="https://www.youtube.com/watch?v=dQw4w9WgXcQ", stream=True):
+        (job / "run.json").write_text(json.dumps({"url": url, "stream": stream}))
+
+    def test_facecam_template_when_the_source_has_a_webcam(self, job):
+        (job / f"{TITLE}_clip_1.mp4").write_bytes(b"clean one")
+        (job / "My_Talk.mp4").write_bytes(b"source")
+        self._run(job)
+        framed = []
+
+        def framer(source, start, end, work):
+            framed.append((os.path.basename(source), start, end))
+            if start == 10.0:
+                return None  # no webcam in this stretch
+            os.makedirs(work, exist_ok=True)
+            path = os.path.join(work, "template.mp4")
+            with open(path, "wb") as f:
+                f.write(b"stacked")
+            return path, 730
+        calls = []
+        rec = sp.edit_stage(str(job), editor=self._editor(calls), framer=framer,
+                            say=lambda *_: None)
+        assert framed == [("My_Talk.mp4", 100.0, 130.0), ("My_Talk.mp4", 10.0, 35.0)]
+        assert calls[0]["clip"] == "template.mp4" and calls[0]["kw"] == {"zoom_from": 730}
+        assert calls[1]["clip"] == f"{TITLE}_clip_2.mp4" and calls[1]["kw"] == {}
+        assert [rec["shorts"][k]["layout"] for k in ("0", "1")] == ["facecam", "main"]
+
+    def test_a_failing_template_keeps_main_framing(self, job):
+        (job / f"{TITLE}_clip_1.mp4").write_bytes(b"clean one")
+        (job / "My_Talk.mp4").write_bytes(b"source")
+        self._run(job)
+
+        def framer(*a):
+            raise RuntimeError("no decoder")
+        calls = []
+        rec = sp.edit_stage(str(job), editor=self._editor(calls), framer=framer,
+                            say=lambda *_: None)
+        assert rec["errors"] == [] and calls[0]["clip"] == f"{TITLE}_clip_1.mp4"
+        sp.edit_stage(str(job), editor=self._editor(calls), framer=framer, template="none",
+                      say=lambda *_: None)
+        assert calls[-1]["kw"] == {}
+
+    def test_template_only_for_a_youtube_stream(self, job):
+        (job / f"{TITLE}_clip_1.mp4").write_bytes(b"clean one")
+        (job / "My_Talk.mp4").write_bytes(b"source")
+        asked = []
+
+        def framer(source, start, end, work):
+            asked.append(start)
+            return None
+
+        def run_edit():
+            asked.clear()
+            sp.edit_stage(str(job), editor=self._editor([]), framer=framer,
+                          say=lambda *_: None)
+            return bool(asked)
+        assert run_edit() is False                       # no run.json: unknown source
+        self._run(job, stream=False)
+        assert run_edit() is False                       # a YouTube video, not a stream
+        self._run(job, url="https://www.twitch.tv/videos/123", stream=True)
+        assert run_edit() is False                       # a stream, not on YouTube
+        self._run(job, stream=True)
+        assert run_edit() is True                        # stream_batch's chunks
+        self._run(job, url="https://youtu.be/dQw4w9WgXcQ", stream=False)
+        meta = json.loads((job / f"{TITLE}_metadata.json").read_text())
+        meta["source_live_status"] = "was_live"
+        (job / f"{TITLE}_metadata.json").write_text(json.dumps(meta))
+        assert run_edit() is True                        # a URL run of a stream VOD

@@ -201,10 +201,22 @@ def zoom_expr(beats, max_zoom=1.12):
     return f"(1+{max_zoom - 1:.3f}*{m})"
 
 
-def punch(src, out, w, h, fps, duration, beats):
+def punch(src, out, w, h, fps, duration, beats, zoom_from=0):
+    """Punch-ins on ``beats``. ``zoom_from``: only the band below this row
+    zooms (the gameplay of the streamer template); the camera above stays."""
     z = zoom_expr(beats)
-    graph = (f"[0:v]scale=w='2*trunc({w}*{z}/2)':h='2*trunc({h}*{z}/2)':eval=frame:"
-             f"flags=bicubic,crop={w}:{h}:(iw-{w})/2:(ih-{h})/2,setsar=1[v]")
+    zoom_from = int(zoom_from or 0)
+    zoom_from -= zoom_from % 2
+    if 0 < zoom_from < h - 2:
+        bh = h - zoom_from
+        graph = (f"[0:v]split=2[t][b];[t]crop={w}:{zoom_from}:0:0[top];"
+                 f"[b]crop={w}:{bh}:0:{zoom_from},"
+                 f"scale=w='2*trunc({w}*{z}/2)':h='2*trunc({bh}*{z}/2)':eval=frame:"
+                 f"flags=bicubic,crop={w}:{bh}:(iw-{w})/2:(ih-{bh})/2[bot];"
+                 f"[top][bot]vstack=inputs=2,setsar=1[v]")
+    else:
+        graph = (f"[0:v]scale=w='2*trunc({w}*{z}/2)':h='2*trunc({h}*{z}/2)':eval=frame:"
+                 f"flags=bicubic,crop={w}:{h}:(iw-{w})/2:(ih-{h})/2,setsar=1[v]")
     run(["ffmpeg", "-v", "error", "-y", "-i", src, "-filter_complex", graph, "-map", "[v]",
          "-map", "0:a", "-c:v", "libx264", "-crf", "16", "-preset", "veryfast",
          "-c:a", "copy", out])
@@ -269,7 +281,7 @@ def loudnorm(src, out):
 
 
 def full_edit(clip, words, hook_text, out, work, *, cold_open=True, sfx=True,
-              max_seconds=59.5):
+              max_seconds=59.5, zoom_from=0):
     """Style C on one vertical clip without captions or hook: quiet pauses
     trimmed, cold open (when it still fits ``max_seconds``), punch-ins,
     one-word captions, hook, sound effects, -14 LUFS. ``words`` are the clip's
@@ -314,7 +326,8 @@ def full_edit(clip, words, hook_text, out, work, *, cold_open=True, sfx=True,
             cues = [(hit, 0.0), (whoosh, lead - 0.3)] + cues
     report.update(seconds=round(f_dur, 2), punch_ins=f_beats, sfx=len(cues or []))
     report["captions"] = _finish(src, f_words, f_dur, f_beats, w, h, fps, hook_text,
-                                 os.path.join(work, "edit"), out, sfx=cues)
+                                 os.path.join(work, "edit"), out, sfx=cues,
+                                 zoom_from=zoom_from)
     report["words"] = f_words
     return report
 
@@ -340,10 +353,11 @@ def build(clip, hook_text, out_dir, published=None):
     return report
 
 
-def _finish(src, words, duration, beats, w, h, fps, hook_text, stem, out, sfx):
+def _finish(src, words, duration, beats, w, h, fps, hook_text, stem, out, sfx,
+            zoom_from=0):
     """Punch, caption, hook, then effects or loudness. Returns the .ass burned."""
     punched = stem + "_punch.mp4"
-    punch(src, punched, w, h, fps, duration, beats)
+    punch(src, punched, w, h, fps, duration, beats, zoom_from=zoom_from)
     captioned = stem + "_caps.mp4"
     ass = captions(punched, captioned, words, duration)
     hooked = stem + "_hook.mp4"
